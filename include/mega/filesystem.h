@@ -411,6 +411,9 @@ struct MEGA_API FileSystemAccess : public EventTrigger
     // locate byte offset of last path component
     virtual size_t lastpartlocal(string*) const = 0;
 
+    // return the name from the path.
+    string getname(string*) const;
+
     // obtain lowercased extension
     virtual bool getextension(string*, char*, size_t) const = 0;
 

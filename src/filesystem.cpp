@@ -43,6 +43,13 @@ void FileSystemAccess::captimestamp(m_time_t* t)
     else if (*t < 0) *t = 0;
 }
 
+string FileSystemAccess::getname(string* localPath) const
+{
+    const auto index = lastpartlocal(localPath);
+
+    return localPath->substr(index);
+}
+
 bool FileSystemAccess::islchex(char c) const
 {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');

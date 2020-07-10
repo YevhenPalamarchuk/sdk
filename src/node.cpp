@@ -204,6 +204,20 @@ Node::~Node()
 #endif
 }
 
+#ifdef ENABLE_SYNC
+
+bool Node::isIgnoreFile() const
+{
+    attr_map::const_iterator name_it;
+
+    return client->ignoreFilesEnabled
+           && type == FILENODE
+           && ((name_it = attrs.map.find('n')) != attrs.map.end())
+           && name_it->second == Sync::IGNOREFILE_NAME;
+}
+
+#endif /* ENABLE_SYNC */
+
 void Node::setkeyfromjson(const char* k)
 {
     if (keyApplied()) --client->mAppliedKeyNodeCount;
@@ -1161,6 +1175,8 @@ void LocalNode::setnameparent(LocalNode* newparent, string* newlocalpath, std::u
     int nc = 0;
     Sync* oldsync = NULL;
 
+    updateFilterState(newparent, newlocalpath);
+
     if (parent)
     {
         // remove existing child linkage
@@ -1363,15 +1379,30 @@ void LocalNode::init(Sync* csync, nodetype_t ctype, LocalNode* cparent, string* 
 
     bumpnagleds();
 
+    mDownloading = false;
+    mExcluded = false;
+    mInhibitFilterUpdate = false;
+    mIsIgnoreFile = false;
+    mLoadFailed = false;
+    mLoadPending = false;
+    mParentLoadPending = false;
+    mParentLoadFailed = false;
+
     if (cparent)
     {
         setnameparent(cparent, cfullpath, std::move(shortname));
     }
     else
     {
+        assert(type == FOLDERNODE);
+
         localname = *cfullpath;
         slocalname.reset(shortname && *shortname != localname ? shortname.release() : nullptr);
         sync->client->fsaccess->local2path(&localname, &name);
+
+        mIgnoreFilePath = localname;
+        mIgnoreFilePath.append(sync->client->fsaccess->localseparator);
+        mIgnoreFilePath.append(Sync::IGNOREFILE_NAME);
     }
 
     scanseqno = sync->scanseqno;
@@ -1549,13 +1580,16 @@ LocalNode::~LocalNode()
     {
         sync->statecachedel(this);
 
-        if (type == FOLDERNODE)
+        if (!mExcluded)
         {
-            sync->client->app->syncupdate_local_folder_deletion(sync, this);
-        }
-        else
-        {
-            sync->client->app->syncupdate_local_file_deletion(sync, this);
+            if (type == FOLDERNODE)
+            {
+                sync->client->app->syncupdate_local_folder_deletion(sync, this);
+            }
+            else
+            {
+                sync->client->app->syncupdate_local_file_deletion(sync, this);
+            }
         }
     }
 
@@ -1602,6 +1636,7 @@ LocalNode::~LocalNode()
 
     for (localnode_map::iterator it = children.begin(); it != children.end(); )
     {
+        it->second->mInhibitFilterUpdate = true;
         delete it++->second;
     }
 
@@ -1613,7 +1648,7 @@ LocalNode::~LocalNode()
         {
             node->localnode = NULL;
         }
-        else
+        else if (!(mExcluded || mParentLoadFailed))
         {
             sync->client->movetosyncdebris(node, sync->inshare);
         }
@@ -1855,6 +1890,840 @@ LocalNode* LocalNode::unserialize(Sync* sync, const string* d)
     l->checked = h != UNDEF; // TODO: Is this a bug? h will never be UNDEF
 
     return l;
+}
+
+bool LocalNode::anyLoadFailed() const
+{
+    return mLoadFailed | mParentLoadFailed;
+}
+
+bool LocalNode::anyLoadPending() const
+{
+    return mLoadPending | mParentLoadPending;
+}
+
+bool LocalNode::excluded(const string& name) const
+{
+    assert(type == FOLDERNODE);
+
+    string path;
+    getlocalpath(&path);
+
+    if (mExcluded)
+    {
+        LOG_verbose << name << " excluded by excluded parent " << path;
+        return true;
+    }
+
+    string_pair namePath(name, name);
+    string localPath(localname);
+    auto* node = this;
+    auto* separator = FileSystemAccess::getPathSeparator();
+
+    // check for an exclusion.
+    for ( ; node; node = node->parent)
+    {
+        if (node->mFilters.excluded(namePath, node != this))
+        {
+            break;
+        }
+
+        // local path.
+        localPath.insert(0, localPath.size() > 0, *separator);
+        localPath.insert(0, node->localname);
+
+        // normalized path.
+        // separator is always '/'.
+        namePath.second.insert(0, namePath.second.size() > 0, '/');
+        namePath.second.insert(0, node->name);
+    }
+    
+    if (node)
+    {
+        // excluded by some parent.
+        if (node != this)
+        {
+            // recompute path if necessary for logging purposes.
+            node->getlocalpath(&path);
+        }
+    }
+    else
+    {
+        // check static rules if name wasn't excluded by any parent.
+        auto& app = *sync->client->app;
+
+        // don't bother testing for an inclusion if we weren't excluded.
+        if (app.sync_syncable(sync, name.c_str(), &localPath))
+        {
+            return false;
+        }
+        else
+        {
+            path = "static rule";
+        }
+    }
+
+    namePath.second = name;
+
+    // check for an explicit inclusion.
+    for (auto *inode = this; inode; inode = inode->parent)
+    {
+        if (inode->mFilters.included(namePath, inode != this))
+        {
+            if (inode != node)
+            {
+                // recompute path only if necessary.
+                inode->getlocalpath(&path);
+            }
+
+            LOG_verbose << name << " explicitly included by " << path;
+            return false;
+        }
+
+        namePath.second.insert(0, namePath.second.size() > 0, '/');
+        namePath.second.insert(0, inode->name);
+    }
+
+    LOG_verbose << name << " excluded by " << path;
+    return true;
+}
+
+bool LocalNode::excluded() const
+{
+    return mExcluded;
+}
+
+void LocalNode::ignoreFileDownloading()
+{
+    assert(type == FOLDERNODE);
+
+    if (mDownloading)
+    {
+        return;
+    }
+
+    mDownloading = true;
+
+    const bool changed =
+      loadFailed(false) | loadPending(true);
+
+    if (!changed)
+    {
+        return;
+    }
+
+    for (auto& child_it : children)
+    {
+        child_it.second->updateFilterState();
+    }
+}
+
+const string& LocalNode::ignoreFilePath() const
+{
+    assert(type == FOLDERNODE);
+
+    return mIgnoreFilePath;
+}
+
+bool LocalNode::included(const string& name) const
+{
+    assert(type == FOLDERNODE);
+
+    return !excluded(name);
+}
+
+void LocalNode::inhibitFilterUpdate()
+{
+    assert(type == FILENODE);
+
+    mInhibitFilterUpdate = true;
+}
+
+bool LocalNode::isIgnoreFile() const
+{
+    return sync->client->ignoreFilesEnabled
+           && mIsIgnoreFile;
+}
+
+bool LocalNode::loadFilters(const bool updating)
+{
+    assert(type == FOLDERNODE);
+
+    if (!canPerformLoad())
+    {
+        return loadPending(true);
+    }
+
+    auto fileAccess =
+      sync->client->fsaccess->newfileaccess(false);
+    bool failed = true;
+
+    if (fileAccess->fopen(&mIgnoreFilePath, true, false))
+    {
+        FilterChain filters;
+
+        if (filters.load(*fileAccess))
+        {
+            mFilters = std::move(filters);
+            failed = false;
+        }
+    }
+
+    mDownloading = false;
+
+    const bool changed =
+      loadFailed(failed) | loadPending(failed);
+
+    if (updating)
+    {
+        return changed;
+    }
+
+    for (auto& child_it : children)
+    {
+        child_it.second->updateFilterState(true);
+    }
+
+    return changed;
+}
+
+bool LocalNode::loadPending() const
+{
+    assert(type == FOLDERNODE);
+
+    return mLoadPending;
+}
+
+bool LocalNode::parentLoadPending() const
+{
+    return mParentLoadPending;
+}
+
+int LocalNode::performPendingLoad()
+{
+    assert(type == FOLDERNODE);
+    assert(mLoadPending);
+
+    loadFilters();
+
+    return 1 - mLoadPending - mLoadFailed;
+}
+
+void LocalNode::purgeFilterState()
+{
+    assert(type == FOLDERNODE);
+    assert(parent == nullptr);
+
+    localnode_list pending;
+
+    // Purge our filter state.
+    purgeGeneralFilterState();
+    purgeDirectoryFilterState();
+
+    // Root is never excluded.
+    mExcluded = false;
+
+    // Process our immediate children.
+    for (auto& child_it : children)
+    {
+        LocalNode& child = *child_it.second;
+
+        // Purge common filter state.
+        child.purgeGeneralFilterState();
+
+        // Child might be excluded by global filters.
+        child.mExcluded = excluded(child.name);
+
+        // Process files directly.
+        if (child.type == FILENODE)
+        {
+            child.purgeFileFilterState();
+            continue;
+        }
+
+        // Queue directories for traversal.
+        pending.emplace_back(&child);
+    }
+
+    // Process subdirectories.
+    while (pending.size())
+    {
+        LocalNode& node = *pending.front();
+
+        // Purge our filter state.
+        node.purgeDirectoryFilterState();
+
+        // Process our immediate children.
+        for(auto& child_it : node.children)
+        {
+            LocalNode& child = *child_it.second;
+
+            // Purge common filter state.
+            child.purgeGeneralFilterState();
+
+            // Child might be excluded by global filters.
+            child.mExcluded =
+              child.parent->excluded(child.name);
+
+            // Process children immediately.
+            if (child.type == FILENODE)
+            {
+                child.purgeFileFilterState();
+                continue;
+            }
+
+            // Queue subdirectories for traversal.
+            pending.emplace_back(&child);
+        }
+
+        // We're done with this node.
+        pending.pop_front();
+    }
+}
+
+void LocalNode::restoreFilterState()
+{
+    assert(type == FOLDERNODE);
+    assert(parent == nullptr);
+
+    localnode_list pending;
+
+    // Restore our filter state.
+    restoreGeneralFilterState();
+    restoreDirectoryFilterState();
+
+    // Process our immediate children.
+    for (auto& child_it : children)
+    {
+        LocalNode& child = *child_it.second;
+
+        // Restore common filter state.
+        child.restoreGeneralFilterState();
+
+        // Are we excluded?
+        child.mExcluded = excluded(child.name);
+
+        // Process files directly.
+        if (child.type == FILENODE)
+        {
+            child.restoreFileFilterState();
+            continue;
+        }
+
+        // Queue subdirectories.
+        pending.emplace_back(&child);
+    }
+
+    // Process subdirectories.
+    while (pending.size())
+    {
+        LocalNode& node = *pending.front();
+
+        // Restore our filter state.
+        node.restoreDirectoryFilterState();
+
+        // Process direct children.
+        for (auto& child_it : node.children)
+        {
+            LocalNode& child = *child_it.second;
+
+            // Restore common filter state.
+            child.restoreGeneralFilterState();
+
+            // Is the child excluded?
+            child.mExcluded =
+              child.parent->excluded(child.name);
+
+            // Process files directly.
+            if (child.type == FILENODE)
+            {
+                child.restoreFileFilterState();
+                continue;
+            }
+
+            // Queue subdirectories.
+            pending.emplace_back(&child);
+        }
+
+        // We're done with this directory.
+        pending.pop_front();
+    }
+}
+
+void LocalNode::updateFilterState(const bool force)
+{
+    localnode_list pending(1, this);
+
+    while (pending.size())
+    {
+        LocalNode& node = *pending.front();
+
+        pending.pop_front();
+
+        bool changed = node.updateGeneralFilterState();
+
+        if (node.type != FOLDERNODE)
+        {
+            continue;
+        }
+
+        if (node.mLoadPending)
+        {
+            changed |= node.loadFilters(true);
+        }
+
+        if (!(changed || force))
+        {
+            continue;
+        }
+
+        for (auto& child_it : node.children)
+        {
+            pending.emplace_back(child_it.second);
+        }
+    }
+}
+
+bool LocalNode::canPerformLoad() const
+{
+    assert(type == FOLDERNODE);
+
+    if (mExcluded || mParentLoadPending)
+    {
+        return false;
+    }
+
+    if (mDownloading)
+    {
+        return isIgnoreFileDownloading();
+    }
+
+    return true;
+}
+
+bool LocalNode::clearFilters()
+{
+    assert(type == FOLDERNODE);
+
+    bool changed = !mFilters.empty();
+
+    mFilters.clear();
+
+    mDownloading = false;
+
+    changed |= loadFailed(false);
+    changed |= loadPending(false);
+
+    return changed;
+}
+
+bool LocalNode::excluded(const bool excluded)
+{
+    const bool changed = mExcluded ^ excluded;
+
+    mExcluded = excluded;
+
+    return changed;
+}
+
+bool LocalNode::hasIgnoreFile() const
+{
+    return children.count(&Sync::IGNOREFILE_NAME);
+}
+
+bool LocalNode::isAbove(const LocalNode& other) const
+{
+    return other.isBelow(*this);
+}
+
+bool LocalNode::isBelow(const LocalNode& other) const
+{
+    for (auto* node = parent; node; node = node->parent)
+    {
+        if (node == &other)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool LocalNode::isIgnoreFile(const bool ignoreFile)
+{
+    assert(type == FILENODE);
+
+    const bool changed = mIsIgnoreFile ^ ignoreFile;
+
+    mIsIgnoreFile = ignoreFile;
+
+    return changed;
+}
+
+bool LocalNode::isIgnoreFileDownloading() const
+{
+    assert(type == FOLDERNODE);
+
+    if (!node)
+    {
+        return false;
+    }
+
+    for (auto& child_it : node->children)
+    {
+        if (child_it->syncget && child_it->isIgnoreFile())
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool LocalNode::loadFailed(const bool failed)
+{
+    assert(type == FOLDERNODE);
+
+    if (mLoadFailed == failed)
+    {
+        return false;
+    }
+
+    mLoadFailed = failed;
+
+    // For convenience.
+    auto& it = mIgnoreFileFailuresIt;
+    auto& list = sync->client->ignoreFileFailures;
+
+    if (failed)
+    {
+        it = list.emplace(list.end(), this);
+    }
+    else
+    {
+        list.erase(it);
+    }
+
+    return true;
+}
+
+bool LocalNode::loadPending(const bool pending)
+{
+    assert(type == FOLDERNODE);
+
+    const bool changed = mLoadPending ^ pending;
+
+    mLoadPending = pending;
+
+    return changed;
+}
+
+bool LocalNode::parentLoadFailed(const bool failed)
+{
+    const bool changed = mParentLoadFailed ^ failed;
+
+    mParentLoadFailed = failed;
+
+    return changed;
+}
+
+bool LocalNode::parentLoadFailed() const
+{
+    return mParentLoadFailed;
+}
+
+bool LocalNode::parentLoadPending(const bool pending)
+{
+    const bool changed = mParentLoadPending ^ pending;
+
+    mParentLoadPending = pending;
+
+    return changed;
+}
+
+void LocalNode::purgeDirectoryFilterState()
+{
+    assert(type == FOLDERNODE);
+
+    mDownloading = false;
+
+    if (mLoadFailed)
+    {
+        auto& list = sync->client->ignoreFileFailures;
+
+        list.erase(mIgnoreFileFailuresIt);
+
+        mLoadFailed = false;
+    }
+
+    mFilters.clear();
+    mLoadPending = false;
+}
+
+void LocalNode::purgeFileFilterState()
+{
+    assert(type == FILENODE);
+
+    mIsIgnoreFile = false;
+}
+
+void LocalNode::purgeGeneralFilterState()
+{
+    mParentLoadFailed = false;
+    mParentLoadPending = false;
+}
+
+void LocalNode::restoreDirectoryFilterState()
+{
+    assert(type == FOLDERNODE);
+
+    if (parent)
+    {
+        mParentLoadPending |= parent->anyLoadPending();
+        mParentLoadFailed |= parent->anyLoadFailed();
+    }
+
+    if (isIgnoreFileDownloading())
+    {
+        mDownloading = true;
+        mLoadPending = true;
+    }
+    else if (hasIgnoreFile())
+    {
+        loadFilters(true);
+    }
+}
+
+void LocalNode::restoreFileFilterState()
+{
+    assert(type == FILENODE);
+
+    mIsIgnoreFile = name == Sync::IGNOREFILE_NAME;
+}
+
+void LocalNode::restoreGeneralFilterState()
+{
+    if (parent)
+    {
+        mParentLoadPending |= parent->anyLoadPending();
+        mParentLoadFailed |= parent->anyLoadFailed();
+    }
+}
+
+void LocalNode::updateFilterState(LocalNode* newParent, string* newPath)
+{
+    if (!newParent)
+    {
+        if (!isIgnoreFile())
+        {
+            return;
+        }
+
+        parent->clearFilters();
+
+        if (!mInhibitFilterUpdate)
+        {
+            parent->updateFilterState(true);
+        }
+
+        return;
+    }
+
+    auto& client = *sync->client;
+    auto& fsAccess = *client.fsaccess;
+
+    string oldName;
+    string newName = fsAccess.getname(newPath);
+    LocalNode* oldParent = parent;
+    bool mustDetachRemote = false;
+    bool mustRubbishRemote = false;
+    bool mustUpdateCache = false;
+    bool wasExcluded = mExcluded;
+    bool wasIgnoreFile = isIgnoreFile();
+
+    if (localname != newName)
+    {
+        oldName = std::move(name);
+        fsAccess.local2name(&name, sync->mFilesystemType);
+        name = std::move(newName);
+
+        if (type == FILENODE)
+        {
+            mIsIgnoreFile = name == Sync::IGNOREFILE_NAME;
+        }
+        else
+        {
+            mIgnoreFilePath = *newPath;
+            mIgnoreFilePath.append(fsAccess.localseparator);
+            mIgnoreFilePath.append(Sync::IGNOREFILE_NAME);
+        }
+
+        mustDetachRemote |= mExcluded | anyLoadPending();
+    }
+
+    parent = newParent;
+
+    if (oldParent && oldParent != newParent)
+    {
+        oldParent->children.erase(&localname);
+        newParent->children.emplace(&localname, this);
+
+        mustDetachRemote |= mExcluded | anyLoadPending();
+    }
+
+    updateFilterState();
+
+    if (isIgnoreFile())
+    {
+        newParent->loadFilters();
+
+        if (wasIgnoreFile)
+        {
+            oldParent->clearFilters();
+
+            if (oldParent == newParent || newParent->isAbove(*oldParent))
+            {
+                newParent->updateFilterState(true);
+            }
+            else if (parent->isBelow(*oldParent))
+            {
+                oldParent->updateFilterState(true);
+            }
+            else
+            {
+                oldParent->updateFilterState(true);
+                newParent->updateFilterState(true);
+            }
+        }
+        else
+        {
+            newParent->updateFilterState(true);
+        }
+    }
+    else if (wasIgnoreFile)
+    {
+        oldParent->clearFilters();
+        oldParent->updateFilterState(true);
+    }
+
+    mustRubbishRemote = wasExcluded ^ mExcluded;
+
+    if (oldName.size())
+    {
+        name = std::move(oldName);
+    }
+
+    parent = oldParent;
+
+    if (oldParent && oldParent != newParent)
+    {
+        newParent->children.erase(&localname);
+        oldParent->children.emplace(&localname, this);
+    }
+
+    if (node && mustDetachRemote)
+    {
+        node->localnode = nullptr;
+        node->tag = sync->tag;
+        node = nullptr;
+
+        mustUpdateCache = true;
+    }
+
+    if (node && mustRubbishRemote)
+    {
+        client.movetosyncdebris(node, sync->inshare);
+        mustUpdateCache = true;
+    }
+
+    if (mustUpdateCache)
+    {
+        created = false;
+        sync->statecacheadd(this);
+    }
+}
+
+bool LocalNode::updateGeneralFilterState()
+{
+    bool changed = false;
+
+    if (parent)
+    {
+        changed |= excluded(parent->excluded(name));
+        changed |= parentLoadFailed(parent->anyLoadFailed());
+        changed |= parentLoadPending(parent->anyLoadPending());
+    }
+    else
+    {
+        changed |= excluded(false);
+        changed |= parentLoadFailed(false);
+        changed |= parentLoadPending(false);
+    }
+
+    return changed;
+}
+
+list<pair<const string*, LocalNode*>> inSyncOrder(const localnode_map& children)
+{
+    list<pair<const string*, LocalNode*>> directories;
+    list<pair<const string*, LocalNode*>> files;
+
+    for (auto &child_it : children)
+    {
+        if (child_it.second->excluded())
+        {
+            continue;
+        }
+
+        if (child_it.second->type == FILENODE)
+        {
+            if (child_it.second->isIgnoreFile())
+            {
+                directories.emplace_front(child_it);
+            }
+            else
+            {
+                files.emplace_back(child_it);
+            }
+        }
+        else
+        {
+            directories.emplace_back(child_it);
+        }
+    }
+
+    directories.splice(directories.end(), files);
+
+    return directories;
+}
+
+list<pair<const string*, Node*>> inSyncOrder(const remotenode_map& children)
+{
+    list<pair<const string*, Node*>> directories;
+    list<pair<const string*, Node*>> files;
+
+    for (auto &child_it : children)
+    {
+        if (child_it.second->type == FILENODE)
+        {
+            if (child_it.second->isIgnoreFile())
+            {
+                directories.emplace_front(child_it);
+            }
+            else
+            {
+                files.emplace_back(child_it);
+            }
+        }
+        else
+        {
+            directories.emplace_back(child_it);
+        }
+    }
+
+    directories.splice(directories.end(), files);
+
+    return directories;
 }
 
 #endif

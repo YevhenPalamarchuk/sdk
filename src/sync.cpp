@@ -33,6 +33,8 @@
 
 namespace mega {
 
+const string Sync::IGNOREFILE_NAME = ".megaignore";
+const int Sync::IGNOREFILE_DELAY_DS = 30;
 const int Sync::SCANNING_DELAY_DS = 5;
 const int Sync::EXTRA_SCANNING_DELAY_DS = 150;
 const int Sync::FILE_UPDATE_DELAY_DS = 30;
@@ -1144,10 +1146,8 @@ bool Sync::assignfsids()
 // localpath must be prefixed with Sync
 bool Sync::scan(string* localpath, FileAccess* fa)
 {
-    if (fa)
-    {
-        assert(fa->type == FOLDERNODE);
-    }
+    assert(!fa || fa->type == FOLDERNODE);
+
     if (isPathSyncable(*localpath, localdebris, client->fsaccess->localseparator))
     {
         DirAccess* da;
@@ -1168,8 +1168,48 @@ bool Sync::scan(string* localpath, FileAccess* fa)
         {
             size_t t = localpath->size();
 
-            while (da->dnext(localpath, &localname, client->followsymlinks))
+            // prioritize handling of ignore files as they dictate how we
+            // should handle this directory's contents.
+            do
             {
+                if (t)
+                {
+                    localpath->append(client->fsaccess->localseparator);
+                }
+
+                localpath->append(IGNOREFILE_NAME);
+
+                auto fileaccess = client->fsaccess->newfileaccess(client->followsymlinks);
+                if (!fileaccess->fopen(localpath))
+                {
+                    break;
+                }
+
+                LocalNode* node = nullptr;
+
+                if (initializing)
+                {
+                    node = checkpath(NULL, localpath, NULL, NULL, false, NULL);
+                }
+
+                if (!node || node == (LocalNode*)~0)
+                {
+                    dirnotify->notify(DirNotify::DIREVENTS, NULL, localpath->data(), localpath->size(), true);
+                }
+            }
+            while (false);
+
+            nodetype_t type;
+            localpath->resize(t);
+
+            while (da->dnext(localpath, &localname, client->followsymlinks, &type))
+            {
+                // ignore files are processed above.
+                if (type == FILENODE && localname == IGNOREFILE_NAME)
+                {
+                    continue;
+                }
+
                 name = localname;
                 client->fsaccess->local2name(&name, mFilesystemType);
 
@@ -1180,29 +1220,21 @@ bool Sync::scan(string* localpath, FileAccess* fa)
 
                 localpath->append(localname);
 
-                // check if this record is to be ignored
-                if (client->app->sync_syncable(this, name.c_str(), localpath))
+                // skip the sync's debris folder
+                if (isPathSyncable(*localpath, localdebris, client->fsaccess->localseparator))
                 {
-                    // skip the sync's debris folder
-                    if (isPathSyncable(*localpath, localdebris, client->fsaccess->localseparator))
+                    LocalNode *l = NULL;
+                    if (initializing)
                     {
-                        LocalNode *l = NULL;
-                        if (initializing)
-                        {
-                            // preload all cached LocalNodes
-                            l = checkpath(NULL, localpath, nullptr, nullptr, false, da);
-                        }
-
-                        if (!l || l == (LocalNode*)~0)
-                        {
-                            // new record: place in notification queue
-                            dirnotify->notify(DirNotify::DIREVENTS, NULL, localpath->data(), localpath->size(), true);
-                        }
+                        // preload all cached LocalNodes
+                        l = checkpath(NULL, localpath, nullptr, nullptr, false, da);
                     }
-                }
-                else
-                {
-                    LOG_debug << "Excluded: " << name;
+
+                    if (!l || l == (LocalNode*)~0)
+                    {
+                        // new record: place in notification queue
+                        dirnotify->notify(DirNotify::DIREVENTS, NULL, localpath->data(), localpath->size(), true);
+                    }
                 }
 
                 localpath->resize(t);
@@ -1213,7 +1245,8 @@ bool Sync::scan(string* localpath, FileAccess* fa)
 
         return success;
     }
-    else return false;
+
+    return false;
 }
 
 // check local path - if !localname, localpath is relative to l, with l == NULL
@@ -1298,22 +1331,49 @@ LocalNode* Sync::checkpath(LocalNode* l, string* localpath, string* localname, d
         string name = newname.size() ? newname : l->name;
         client->fsaccess->local2name(&name, mFilesystemType);
 
-        if (!client->app->sync_syncable(this, name.c_str(), &tmppath))
-        {
-            LOG_debug << "Excluded: " << path;
-            return NULL;
-        }
-
         isroot = l == localroot.get() && !newname.size();
     }
 
     LOG_verbose << "Scanning: " << path << " in=" << initializing << " full=" << fullscan << " l=" << l;
 
-    // postpone moving nodes into nonexistent parents
-    if (parent && !parent->node)
+    if (parent && !parent->excluded())
     {
-        LOG_warn << "Parent doesn't exist yet: " << path;
-        return (LocalNode*)~0;
+        // in case backoffds == nullptr.
+        dstime dummy = 0;
+
+        // postpone moving nodes into existing parents.
+        if (!parent->node)
+        {
+            LOG_warn << "Parent doesn't exist yet: " << path;
+            return (LocalNode*)~0;
+        }
+
+        // "effective" back-off timer.
+        dstime* backoff = backoffds ? backoffds : &dummy;
+
+        // assume filter ops require us to defer this subtree.
+        *backoff = IGNOREFILE_DELAY_DS;
+
+        // some parent of ours has a pending filter load.
+        if (parent->parentLoadPending())
+        {
+            // retry later.
+            return nullptr;
+        }
+
+        // our parent has a pending filter laod.
+        if (parent->loadPending())
+        {
+            // try and perform the load.
+            if (parent->performPendingLoad() < 0)
+            {
+                // can't load, retry later.
+                return nullptr;
+            }
+        }
+
+        // no retry necessary.
+        *backoff = 0;
     }
 
     // attempt to open/type this file
@@ -1447,6 +1507,11 @@ LocalNode* Sync::checkpath(LocalNode* l, string* localpath, string* localname, d
                                     {
                                         LOG_debug << "File move/overwrite detected";
 
+                                        // there's no point updating a parent's filters when its
+                                        // ignore file is being overwitten as that'll happen when
+                                        // setnameparent(...) is called below.
+                                        l->inhibitFilterUpdate();
+
                                         // delete existing LocalNode...
                                         delete l;
 
@@ -1501,6 +1566,11 @@ LocalNode* Sync::checkpath(LocalNode* l, string* localpath, string* localname, d
                             statecacheadd(l);
 
                             fa.reset();
+
+                            if (l->isIgnoreFile())
+                            {
+                                l->parent->loadFilters();
+                            }
 
                             if (isnetwork && l->type == FILENODE)
                             {
@@ -1773,8 +1843,11 @@ LocalNode* Sync::checkpath(LocalNode* l, string* localpath, string* localname, d
                     else if (changed)
                     {
                         client->app->syncupdate_local_file_change(this, l, path.c_str());
+
                         DBTableTransactionCommitter committer(client->tctable); // TODO:  can we use one committer for all the files in the folder?  Or for the whole recursion?
                         client->stopxfer(l, &committer);
+
+                        l->loadFilters();
                     }
 
                     if (newnode || changed)

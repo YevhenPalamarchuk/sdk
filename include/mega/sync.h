@@ -197,6 +197,9 @@ public:
     Sync(MegaClient*, SyncConfig, const char*, string*, Node*, bool, int, void*);
     ~Sync();
 
+    static const string IGNOREFILE_NAME;
+
+    static const int IGNOREFILE_DELAY_DS;
     static const int SCANNING_DELAY_DS;
     static const int EXTRA_SCANNING_DELAY_DS;
     static const int FILE_UPDATE_DELAY_DS;
